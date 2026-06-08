@@ -10,6 +10,8 @@ IMPORTANT:
     - If the generated slug (i.e., the base slug) is already in use by another instance,
         a random suffix will be appended to the slug, while keeping the entire string within the max length.
     - If the base slug is unique, it is returned as-is, without any extra text or digits.
+    - Special characters are automatically converted to URL-safe characters by Django's slugify().
+    - If the input contains only special characters, a random slug will be generated.
 
 Example Usage of `generate_unique_slug`:
 
@@ -45,9 +47,11 @@ import random
 import string
 from django.utils.text import slugify
 from django.db.models import Model
+import uuid
 
 
 MAX_SLUG_LENGTH = 75
+MIN_SUFFIX_LENGTH = 5  # "-" + at least 4 random characters
 
 
 def random_string_generator(size=6, chars=string.ascii_lowercase + string.digits):
@@ -61,7 +65,12 @@ def random_string_generator(size=6, chars=string.ascii_lowercase + string.digits
     
     Returns:
         str: Randomly generated string.
+    
+    Raises:
+        ValueError: If size is not positive.
     """
+    if size <= 0:
+        raise ValueError("size must be a positive integer")
     return ''.join(random.choice(chars) for _ in range(size))
 
 
@@ -79,7 +88,11 @@ def resolve_field_value(instance: Model, field_name: str) -> str:
     
     Raises:
         ValueError: If the field path cannot be resolved.
+        AttributeError: If the field doesn't exist.
     """
+    if not field_name:
+        raise ValueError("field_name cannot be empty")
+    
     attrs = field_name.split("__")
     value = instance
     for attr in attrs:
@@ -119,22 +132,36 @@ def generate_unique_slug(
         str: A unique slug string. The slug will be the slugified version of the field data if it 
             is unique and under the limit. Otherwise, a suffix will be added while keeping the 
             final slug within the length constraint.
+    
+    Raises:
+        ValueError: If parameters are invalid or field cannot be resolved.
     """
+    # Validate parameters
+    if random_digits_size <= 0:
+        raise ValueError("random_digits_size must be a positive integer")
+    if max_length < MIN_SUFFIX_LENGTH:
+        raise ValueError(f"max_length must be at least {MIN_SUFFIX_LENGTH}")
+    
     # Step 1: Resolve field value (supports nested fields using double underscores)
     base_value = resolve_field_value(instance, field_name)
     
     # Step 2: Slugify the raw value
     raw_slug = slugify(base_value)
 
-    # Step 3: Trim the slug to the maximum allowed length
+    # Step 3: Handle empty slug (special characters only)
+    if not raw_slug:
+        # If slugify returns empty, generate a random slug
+        raw_slug = random_string_generator(size=random_digits_size, chars=charset)
+
+    # Step 4: Trim the slug to the maximum allowed length
     base_slug = raw_slug[:max_length]
 
-    # Step 4: Prepare initial slug and model query
+    # Step 5: Prepare initial slug and model query
     slug = base_slug
     Klass = instance.__class__
     filter_kwargs = filter_kwargs or {}
 
-    # Step 5: Fetch all existing slugs that start with the base_slug
+    # Step 6: Fetch all existing slugs that start with the base_slug
     existing_slugs = Klass.objects.filter(
         **{f"{slug_field}__startswith": base_slug},
         **filter_kwargs
@@ -142,22 +169,37 @@ def generate_unique_slug(
 
     existing_slugs = set(existing_slugs)
 
-    # Step 6: If base slug is unique, return it
+    # Step 7: If base slug is unique, return it
     if slug not in existing_slugs:
         return slug
 
-    # Step 7: Try appending suffixes until a unique slug is found
-    while True:
+    # Step 8: Try appending suffixes until a unique slug is found
+    max_attempts = 1000  # Prevent infinite loops
+    attempt = 0
+    
+    while attempt < max_attempts:
+        attempt += 1
+        
         # Create a suffix of fixed size (e.g., "-a1b2")
         suffix = '-' + random_string_generator(size=random_digits_size, chars=charset)
 
         # Truncate base slug to make room for suffix within max_length
         allowed_base_length = max_length - len(suffix)
-        trimmed_base = base_slug[:allowed_base_length]
-
-        # Combine base and suffix
-        new_slug = f"{trimmed_base}{suffix}"
+        
+        # Guard against negative or zero allowed_base_length
+        if allowed_base_length <= 0:
+            # If we can't fit a base + suffix, just use suffix
+            new_slug = suffix[1:]  # Remove leading dash
+        else:
+            trimmed_base = base_slug[:allowed_base_length]
+            new_slug = f"{trimmed_base}{suffix}"
 
         # If the new slug is unique, return it
         if new_slug not in existing_slugs:
             return new_slug
+    
+    # Fallback: if max attempts exceeded, append timestamp-based suffix
+    fallback_suffix = '-' + str(uuid.uuid4())[:8]
+    allowed_base_length = max_length - len(fallback_suffix)
+    trimmed_base = base_slug[:max(1, allowed_base_length)]
+    return f"{trimmed_base}{fallback_suffix}"
